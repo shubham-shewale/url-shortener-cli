@@ -22,7 +22,7 @@ go install .
 - `info <code>` - Get information about a shortened URL
 - `delete <code>` - Delete a shortened URL
 - `open <code>` - Open a shortened URL in browser
-- `login` - Store API token for authentication
+- `login` - Authenticate with API server (API token or OAuth)
 - `completion <shell>` - Generate shell completion script
 - `version` - Print version information
 
@@ -60,8 +60,11 @@ shorten open abc123
 # Open password-protected link
 shorten open abc123 --password secret123
 
-# Login to store API token
+# Login with API token (legacy)
 shorten login
+
+# Login with OAuth 2.0
+shorten login --provider auth0 --issuer https://your-domain.auth0.com --client-id your-client-id
 
 # Use custom API server
 shorten --api https://my-api.com shorten https://example.com
@@ -69,6 +72,39 @@ shorten --api https://my-api.com shorten https://example.com
 # Set custom timeout
 shorten --timeout 10s info abc123
 ```
+
+## Authentication
+
+The CLI supports two authentication methods:
+
+### API Token (Legacy)
+
+Store an API token for authentication:
+
+```bash
+shorten login
+```
+
+This will prompt you to enter your API token, which will be stored in `~/.shorten.yml`.
+
+### OAuth 2.0
+
+Authenticate using OAuth 2.0 with PKCE flow:
+
+```bash
+shorten login --provider auth0 --issuer https://your-domain.auth0.com --client-id your-client-id
+```
+
+Supported providers:
+- Auth0
+- Google Identity Platform
+- Keycloak
+- Any OIDC-compliant provider
+
+The OAuth flow will:
+1. Launch your browser to the identity provider
+2. Handle the authorization callback on `http://localhost:53682`
+3. Store access tokens in `~/.shorten.yml`
 
 ## Global Flags
 

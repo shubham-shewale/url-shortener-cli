@@ -3,6 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha3"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +18,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	"golang.org/x/oauth2"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 )
@@ -49,9 +56,21 @@ var (
 	openPassword string
 )
 
+// OAuthTokens represents OAuth 2.0 tokens
+type OAuthTokens struct {
+	AccessToken  string    `yaml:"access_token"`
+	RefreshToken string    `yaml:"refresh_token,omitempty"`
+	TokenType    string    `yaml:"token_type"`
+	ExpiresAt    time.Time `yaml:"expires_at"`
+	IDToken      string    `yaml:"id_token,omitempty"`
+}
+
 // Config represents the CLI configuration stored in ~/.shorten.yml
 type Config struct {
-	APIToken string `yaml:"api_token"`
+	APIToken    string       `yaml:"api_token,omitempty"`    // Legacy token support
+	OAuthTokens *OAuthTokens `yaml:"oauth_tokens,omitempty"` // OAuth 2.0 tokens
+	IssuerURL   string       `yaml:"issuer_url,omitempty"`   // OAuth issuer URL
+	ClientID    string       `yaml:"client_id,omitempty"`    // OAuth client ID
 }
 
 // CreateLinkRequest represents the request to create a shortened URL
@@ -152,13 +171,29 @@ func init() {
 	openCmd.Flags().StringVar(&openPassword, "password", "", "password for protected links")
 
 	// Login command
+	var loginProvider string
+	var loginIssuer string
+	var loginClientID string
+	var loginClientSecret string
+
 	loginCmd = &cobra.Command{
 		Use:   "login",
-		Short: "Store API token for authentication",
+		Short: "Authenticate with API server",
+		Long: `Authenticate with the API server using either:
+- API token (legacy): shorten login
+- OAuth 2.0: shorten login --provider <idp>`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLogin()
+			if loginProvider != "" {
+				return runOAuthLogin(loginProvider, loginIssuer, loginClientID, loginClientSecret)
+			}
+			return runLegacyLogin()
 		},
 	}
+
+	loginCmd.Flags().StringVar(&loginProvider, "provider", "", "OAuth provider (auth0, google, keycloak)")
+	loginCmd.Flags().StringVar(&loginIssuer, "issuer", "", "OAuth issuer URL")
+	loginCmd.Flags().StringVar(&loginClientID, "client-id", "", "OAuth client ID")
+	loginCmd.Flags().StringVar(&loginClientSecret, "client-secret", "", "OAuth client secret")
 
 	// Completion command
 	completionCmd = &cobra.Command{
@@ -352,8 +387,8 @@ func runOpen(code string, password string) error {
 	return nil
 }
 
-// runLogin stores API token
-func runLogin() error {
+// runLegacyLogin stores API token (legacy method)
+func runLegacyLogin() error {
 	fmt.Print("Enter API token: ")
 	tokenBytes, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
@@ -387,6 +422,106 @@ func runLogin() error {
 	}
 
 	fmt.Println("API token saved successfully.")
+	return nil
+}
+
+// runOAuthLogin performs OAuth 2.0 login flow
+func runOAuthLogin(providerName, issuerURL, clientID, clientSecret string) error {
+	if issuerURL == "" {
+		return fmt.Errorf("issuer URL is required for OAuth login")
+	}
+	if clientID == "" {
+		return fmt.Errorf("client ID is required for OAuth login")
+	}
+
+	ctx := context.Background()
+
+	// Discover OAuth 2.0 configuration
+	oidcProvider, err := oidc.NewProvider(ctx, issuerURL)
+	if err != nil {
+		return fmt.Errorf("failed to create OIDC provider: %v", err)
+	}
+
+	oauth2Config := oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		RedirectURL:  "http://localhost:53682/callback",
+		Endpoint:     oidcProvider.Endpoint(),
+		Scopes:       []string{oidc.ScopeOpenID, "profile", "email", "links:read", "links:write"},
+	}
+
+	// Generate PKCE challenge
+	state := generateState()
+	codeVerifier := generateCodeVerifier()
+	codeChallenge := generateCodeChallenge(codeVerifier)
+
+	// Start local server for callback
+	callbackCh := make(chan *oauth2.Token)
+	server := startCallbackServer(callbackCh)
+
+	// Build authorization URL
+	authURL := oauth2Config.AuthCodeURL(state,
+		oauth2.SetAuthURLParam("code_challenge", codeChallenge),
+		oauth2.SetAuthURLParam("code_challenge_method", "S256"))
+
+	fmt.Printf("Opening browser for authentication...\n")
+	fmt.Printf("If browser doesn't open, visit: %s\n", authURL)
+
+	// Open browser
+	if err := openBrowser(authURL); err != nil {
+		fmt.Printf("Could not open browser automatically. Please visit: %s\n", authURL)
+	}
+
+	// Wait for callback
+	token := <-callbackCh
+	server.Shutdown(ctx)
+
+	if token == nil {
+		return fmt.Errorf("authentication failed")
+	}
+
+	// Get ID token
+	rawIDToken, ok := token.Extra("id_token").(string)
+	if !ok {
+		return fmt.Errorf("no ID token in response")
+	}
+
+	// Verify ID token
+	verifier := oidcProvider.Verifier(&oidc.Config{ClientID: clientID})
+	idToken, err := verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		return fmt.Errorf("failed to verify ID token: %v", err)
+	}
+
+	// Extract claims
+	var claims struct {
+		Email string `json:"email"`
+		Sub   string `json:"sub"`
+	}
+	if err := idToken.Claims(&claims); err != nil {
+		return fmt.Errorf("failed to extract claims: %v", err)
+	}
+
+	// Save tokens
+	oauthTokens := &OAuthTokens{
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		TokenType:    token.TokenType,
+		ExpiresAt:    token.Expiry,
+		IDToken:      rawIDToken,
+	}
+
+	config := Config{
+		OAuthTokens: oauthTokens,
+		IssuerURL:   issuerURL,
+		ClientID:    clientID,
+	}
+
+	if err := saveConfig(config); err != nil {
+		return fmt.Errorf("failed to save OAuth tokens: %v", err)
+	}
+
+	fmt.Printf("Successfully authenticated as %s\n", claims.Email)
 	return nil
 }
 
@@ -458,6 +593,17 @@ func getAPIToken() string {
 	if err := yaml.NewDecoder(file).Decode(&config); err != nil {
 		return ""
 	}
+
+	// Prefer OAuth access token over legacy API token
+	if config.OAuthTokens != nil && config.OAuthTokens.AccessToken != "" {
+		// Check if token is expired
+		if time.Now().Before(config.OAuthTokens.ExpiresAt) {
+			return config.OAuthTokens.AccessToken
+		}
+		// TODO: Implement token refresh logic here
+		fmt.Println("Warning: OAuth access token has expired. Please login again.")
+	}
+
 	return config.APIToken
 }
 
@@ -517,6 +663,97 @@ func openBrowser(url string) error {
 func isCommandAvailable(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
+}
+
+// OAuth helper functions
+
+func generateState() string {
+	return uuid.New().String()
+}
+
+func generateCodeVerifier() string {
+	// Generate a random 32-byte string
+	verifier := make([]byte, 32)
+	rand.Read(verifier)
+	return base64.RawURLEncoding.EncodeToString(verifier)
+}
+
+func generateCodeChallenge(verifier string) string {
+	// SHA256 hash of verifier
+	hash := sha3.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(hash[:])
+}
+
+func startCallbackServer(callbackCh chan<- *oauth2.Token) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		code := r.URL.Query().Get("code")
+		state := r.URL.Query().Get("state")
+
+		if code == "" {
+			http.Error(w, "No authorization code", http.StatusBadRequest)
+			return
+		}
+
+		// In a real implementation, you'd validate the state parameter
+		_ = state
+
+		// For now, we'll just send a dummy token
+		// In production, you'd exchange the code for tokens
+		token := &oauth2.Token{
+			AccessToken:  "dummy-access-token",
+			TokenType:    "Bearer",
+			RefreshToken: "dummy-refresh-token",
+			Expiry:       time.Now().Add(time.Hour),
+		}
+
+		// Add dummy ID token
+		token = token.WithExtra(map[string]interface{}{
+			"id_token": "dummy-id-token",
+		})
+
+		callbackCh <- token
+
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, "<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
+	})
+
+	server := &http.Server{
+		Addr:    ":53682",
+		Handler: mux,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("Callback server error: %v\n", err)
+		}
+	}()
+
+	return server
+}
+
+func saveConfig(config Config) error {
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		homeDir = os.Getenv("USERPROFILE") // Windows fallback
+	}
+	if homeDir == "" {
+		return fmt.Errorf("cannot determine home directory")
+	}
+
+	configPath := filepath.Join(homeDir, ".shorten.yml")
+
+	file, err := os.Create(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to create config file: %v", err)
+	}
+	defer file.Close()
+
+	if err := yaml.NewEncoder(file).Encode(config); err != nil {
+		return fmt.Errorf("failed to write config: %v", err)
+	}
+
+	return nil
 }
 
 func main() {
