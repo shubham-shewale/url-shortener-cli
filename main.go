@@ -442,7 +442,7 @@ func runOAuthLogin(providerName, issuerURL, clientID, clientSecret string) error
 		return fmt.Errorf("failed to create OIDC provider: %v", err)
 	}
 
-	oauth2Config := oauth2.Config{
+	oauth2Config := &oauth2.Config{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		RedirectURL:  "http://localhost:53682/callback",
@@ -455,9 +455,16 @@ func runOAuthLogin(providerName, issuerURL, clientID, clientSecret string) error
 	codeVerifier := generateCodeVerifier()
 	codeChallenge := generateCodeChallenge(codeVerifier)
 
+	flow := &oauthFlow{
+		codeVerifier: codeVerifier,
+		state:        state,
+		config:       oauth2Config,
+		provider:     oidcProvider,
+	}
+
 	// Start local server for callback
-	callbackCh := make(chan *oauth2.Token)
-	server := startCallbackServer(callbackCh)
+	callbackCh := make(chan string)
+	server := startCallbackServer(flow, callbackCh)
 
 	// Build authorization URL
 	authURL := oauth2Config.AuthCodeURL(state,
@@ -472,12 +479,21 @@ func runOAuthLogin(providerName, issuerURL, clientID, clientSecret string) error
 		fmt.Printf("Could not open browser automatically. Please visit: %s\n", authURL)
 	}
 
-	// Wait for callback
-	token := <-callbackCh
+	// Wait for callback code
+	code := <-callbackCh
 	server.Shutdown(ctx)
 
-	if token == nil {
-		return fmt.Errorf("authentication failed")
+	if code == "" {
+		return fmt.Errorf("authentication failed: no code received")
+	}
+
+	// Log for debugging
+	fmt.Printf("[DEBUG] Received authorization code: %s\n", code)
+
+	// Exchange code for token
+	token, err := oauth2Config.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", codeVerifier))
+	if err != nil {
+		return fmt.Errorf("failed to exchange code for token: %v", err)
 	}
 
 	// Get ID token
@@ -501,6 +517,10 @@ func runOAuthLogin(providerName, issuerURL, clientID, clientSecret string) error
 	if err := idToken.Claims(&claims); err != nil {
 		return fmt.Errorf("failed to extract claims: %v", err)
 	}
+
+	// Log OAuth flow details for debugging
+	fmt.Printf("[DEBUG] OAuth login successful for user %s (sub: %s)\n", claims.Email, claims.Sub)
+	fmt.Printf("[DEBUG] Token expiry: %v\n", token.Expiry)
 
 	// Save tokens
 	oauthTokens := &OAuthTokens{
@@ -598,13 +618,20 @@ func getAPIToken() string {
 	if config.OAuthTokens != nil && config.OAuthTokens.AccessToken != "" {
 		// Check if token is expired
 		if time.Now().Before(config.OAuthTokens.ExpiresAt) {
+			fmt.Printf("[DEBUG] Using valid OAuth token (expires: %v)\n", config.OAuthTokens.ExpiresAt)
 			return config.OAuthTokens.AccessToken
 		}
 		// TODO: Implement token refresh logic here
 		fmt.Println("Warning: OAuth access token has expired. Please login again.")
+		fmt.Printf("[DEBUG] Token expired at: %v\n", config.OAuthTokens.ExpiresAt)
+	} else if config.APIToken != "" {
+		fmt.Printf("[DEBUG] Using legacy API token\n")
+		return config.APIToken
+	} else {
+		fmt.Printf("[DEBUG] No token available\n")
 	}
 
-	return config.APIToken
+	return ""
 }
 
 func handleHTTPError(resp *http.Response) error {
@@ -684,35 +711,31 @@ func generateCodeChallenge(verifier string) string {
 	return base64.RawURLEncoding.EncodeToString(hash[:])
 }
 
-func startCallbackServer(callbackCh chan<- *oauth2.Token) *http.Server {
+type oauthFlow struct {
+	codeVerifier string
+	state        string
+	config       *oauth2.Config
+	provider     *oidc.Provider
+}
+
+func startCallbackServer(flow *oauthFlow, callbackCh chan<- string) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")
-		state := r.URL.Query().Get("state")
+		receivedState := r.URL.Query().Get("state")
 
 		if code == "" {
 			http.Error(w, "No authorization code", http.StatusBadRequest)
 			return
 		}
 
-		// In a real implementation, you'd validate the state parameter
-		_ = state
-
-		// For now, we'll just send a dummy token
-		// In production, you'd exchange the code for tokens
-		token := &oauth2.Token{
-			AccessToken:  "dummy-access-token",
-			TokenType:    "Bearer",
-			RefreshToken: "dummy-refresh-token",
-			Expiry:       time.Now().Add(time.Hour),
+		// Validate state
+		if receivedState != flow.state {
+			http.Error(w, "Invalid state parameter", http.StatusBadRequest)
+			return
 		}
 
-		// Add dummy ID token
-		token = token.WithExtra(map[string]interface{}{
-			"id_token": "dummy-id-token",
-		})
-
-		callbackCh <- token
+		callbackCh <- code
 
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprintf(w, "<html><body><h1>Authentication successful!</h1><p>You can close this window.</p></body></html>")
@@ -751,6 +774,13 @@ func saveConfig(config Config) error {
 
 	if err := yaml.NewEncoder(file).Encode(config); err != nil {
 		return fmt.Errorf("failed to write config: %v", err)
+	}
+
+	// Set secure file permissions (0600: owner read/write only)
+	if err := os.Chmod(configPath, 0600); err != nil {
+		fmt.Printf("[DEBUG] Warning: failed to set secure permissions on config file: %v\n", err)
+	} else {
+		fmt.Printf("[DEBUG] Config file permissions set to 0600\n")
 	}
 
 	return nil
